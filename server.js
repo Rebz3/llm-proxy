@@ -2,8 +2,8 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Читаем тело запроса как сырые данные (Buffer), чтобы ничего не сломать при передаче
-app.use(express.raw({ type: '*/*', limit: '50mb' }));
+// Читаем тело запроса как обычный текст, чтобы гарантированно передать его без искажений
+app.use(express.text({ type: '*/*', limit: '50mb' }));
 
 app.all('/*', async (req, res) => {
   // 1. Обработка CORS
@@ -37,7 +37,7 @@ app.all('/*', async (req, res) => {
   let targetBaseUrl = '';
   const fetchHeaders = new Headers();
 
-  // Копируем безопасные заголовки от клиента
+  // Копируем заголовки клиента
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
     if (!['host', 'connection', 'content-length', 'authorization', 'x-forwarded-for', 'x-real-ip', 'forwarded'].includes(lowerKey)) {
@@ -67,12 +67,12 @@ app.all('/*', async (req, res) => {
     headers: fetchHeaders,
   };
 
-  // Передаем тело запроса, если оно есть
-  if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
+  // Передаем тело запроса "как есть" в виде строки
+  if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && typeof req.body === 'string') {
     fetchOptions.body = req.body;
   }
 
-  // 5. Отправляем запрос провайдеру и возвращаем ответ
+  // 5. Отправляем запрос провайдеру
   try {
     const response = await fetch(targetUrl, fetchOptions);
     
