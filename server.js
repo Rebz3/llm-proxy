@@ -2,8 +2,8 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Читаем тело запроса как обычный текст, чтобы гарантированно передать его без искажений
-app.use(express.text({ type: '*/*', limit: '50mb' }));
+// Читаем тело запроса как абсолютно "сырой" буфер, чтобы не потерять ни байта
+app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 app.all('/*', async (req, res) => {
   // 1. Обработка CORS
@@ -40,6 +40,7 @@ app.all('/*', async (req, res) => {
   // Копируем заголовки клиента
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
+    // Мы удаляем старый content-length, чтобы пересчитать его заново
     if (!['host', 'connection', 'content-length', 'authorization', 'x-forwarded-for', 'x-real-ip', 'forwarded'].includes(lowerKey)) {
       fetchHeaders.set(key, value);
     }
@@ -67,12 +68,17 @@ app.all('/*', async (req, res) => {
     headers: fetchHeaders,
   };
 
-  // Передаем тело запроса "как есть" в виде строки
-  if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && typeof req.body === 'string') {
-    fetchOptions.body = req.body;
+  // 5. Жестко фиксируем тело запроса и его размер
+  if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
+    // Превращаем сырой буфер в строку
+    const bodyString = req.body.toString('utf8');
+    fetchOptions.body = bodyString;
+    
+    // ПРИНУДИТЕЛЬНО задаем Content-Length. Это спасет от разбивки на чанки!
+    fetchHeaders.set('Content-Length', Buffer.byteLength(bodyString, 'utf8').toString());
   }
 
-  // 5. Отправляем запрос провайдеру
+  // 6. Отправляем запрос провайдеру
   try {
     const response = await fetch(targetUrl, fetchOptions);
     
