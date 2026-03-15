@@ -7,7 +7,6 @@ app.use(express.raw({ type: '*/*', limit: '50mb' }));
 app.all('/*', async (req, res) => {
   console.log(`\n[${new Date().toISOString()}] Входящий запрос: ${req.method} ${req.path}`);
 
-  // 1. Обработка CORS
   if (req.method === 'OPTIONS') {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -15,7 +14,6 @@ app.all('/*', async (req, res) => {
     return res.status(200).end();
   }
 
-  // 2. Проверка пароля
   const authHeader = req.headers['authorization'];
   let clientPassword = '';
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -33,14 +31,11 @@ app.all('/*', async (req, res) => {
 
   const provider = pathSegments[0].toLowerCase();
   const remainingPath = '/' + pathSegments.slice(1).join('/');
-
   let targetBaseUrl = '';
   const fetchHeaders = new Headers();
 
-  // 3. Копируем заголовки клиента
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
-    // ФИКС: Обязательно вырезаем accept-encoding, чтобы избежать ZlibError!
     const skipHeaders = [
       'host', 'connection', 'content-length', 'authorization', 
       'x-forwarded-for', 'x-real-ip', 'forwarded', 'accept-encoding'
@@ -50,7 +45,6 @@ app.all('/*', async (req, res) => {
     }
   }
 
-  // 4. Подстановка ключей
   if (provider === 'gemini') {
     targetBaseUrl = 'https://generativelanguage.googleapis.com';
     if (remainingPath.includes('/openai/')) {
@@ -70,7 +64,6 @@ app.all('/*', async (req, res) => {
 
   const queryString = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
   const targetUrl = `${targetBaseUrl}${remainingPath}${queryString}`;
-
   const fetchOptions = { method: req.method, headers: fetchHeaders };
 
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
@@ -79,7 +72,7 @@ app.all('/*', async (req, res) => {
     fetchHeaders.set('Content-Length', Buffer.byteLength(bodyString, 'utf8').toString());
   }
 
-  // 5. Выполнение запроса и Стриминг
+  // 5. Выполнение запроса и умный стриминг (с лечением багов Google)
   try {
     const response = await fetch(targetUrl, fetchOptions);
     
@@ -104,18 +97,61 @@ app.all('/*', async (req, res) => {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
     }
-
     res.status(response.status);
 
     if (response.body) {
       const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        // Безопасно конвертируем чанк в Buffer перед отправкой
-        res.write(Buffer.from(value)); 
+
+        // Декодируем входящие байты в текст
+        buffer += decoder.decode(value, { stream: true });
+        
+        // SSE (Server-Sent Events) разделяются двумя переносами строк
+        let parts = buffer.split('\n\n');
+        buffer = parts.pop(); // Последний кусок может быть неполным, оставляем в буфере
+
+        for (const part of parts) {
+          if (part.startsWith('data: ')) {
+            const dataStr = part.slice(6).trim();
+            if (dataStr === '[DONE]') {
+              res.write('data: [DONE]\n\n');
+              continue;
+            }
+
+            try {
+              let dataObj = JSON.parse(dataStr);
+              
+              // --- ИСПРАВЛЕНИЕ БАГА GOOGLE (ИНЪЕКЦИЯ INDEX) ---
+              if (dataObj.choices && dataObj.choices[0] && dataObj.choices[0].delta && dataObj.choices[0].delta.tool_calls) {
+                dataObj.choices[0].delta.tool_calls.forEach((tc, idx) => {
+                  if (tc.index === undefined) {
+                    tc.index = idx; // Жестко добавляем index
+                  }
+                });
+              }
+              // ------------------------------------------------
+
+              // Отправляем вылеченный JSON обратно клиенту
+              res.write(`data: ${JSON.stringify(dataObj)}\n\n`);
+            } catch (e) {
+              // Если это не JSON, отдаем как есть
+              res.write(`${part}\n\n`);
+            }
+          } else {
+            res.write(`${part}\n\n`);
+          }
+        }
       }
+      
+      // Сбрасываем остатки буфера, если они есть
+      if (buffer.length > 0) res.write(buffer);
       res.end();
+      
     } else {
       res.end();
     }
@@ -127,5 +163,5 @@ app.all('/*', async (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`Streaming Proxy listening on port ${port}`);
+  console.log(`Smart Streaming Proxy listening on port ${port}`);
 });
