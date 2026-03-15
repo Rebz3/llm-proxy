@@ -2,11 +2,13 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Читаем тело запроса как "сырой" буфер
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 app.all('/*', async (req, res) => {
   console.log(`\n[${new Date().toISOString()}] Входящий запрос: ${req.method} ${req.path}`);
 
+  // 1. CORS
   if (req.method === 'OPTIONS') {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -14,6 +16,7 @@ app.all('/*', async (req, res) => {
     return res.status(200).end();
   }
 
+  // 2. Безопасность
   const authHeader = req.headers['authorization'];
   let clientPassword = '';
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -24,9 +27,10 @@ app.all('/*', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized: Invalid Proxy Password' });
   }
 
+  // 3. Маршрутизация
   const pathSegments = req.path.split('/').filter(Boolean);
   if (pathSegments.length === 0) {
-    return res.status(200).send('Unified Streaming Proxy is LIVE.');
+    return res.status(200).send('Smart Streaming Proxy is LIVE.');
   }
 
   const provider = pathSegments[0].toLowerCase();
@@ -34,6 +38,7 @@ app.all('/*', async (req, res) => {
   let targetBaseUrl = '';
   const fetchHeaders = new Headers();
 
+  // Копируем заголовки, строго вырезая те, что мешают сжатию
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
     const skipHeaders = [
@@ -67,32 +72,36 @@ app.all('/*', async (req, res) => {
   const fetchOptions = { method: req.method, headers: fetchHeaders };
 
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
-    const bodyString = req.body.toString('utf8');
-    fetchOptions.body = bodyString;
-    fetchHeaders.set('Content-Length', Buffer.byteLength(bodyString, 'utf8').toString());
+    fetchOptions.body = req.body.toString('utf8');
+    fetchHeaders.set('Content-Length', Buffer.byteLength(fetchOptions.body, 'utf8').toString());
   }
 
-  // 5. Выполнение запроса и умный стриминг (с лечением багов Google)
+  // 4. Выполнение запроса
   try {
     const response = await fetch(targetUrl, fetchOptions);
     
+    // ФУНКЦИЯ ОЧИСТКИ ЗАГОЛОВКОВ (чтобы не было ZlibError)
+    const setSafeHeaders = (sourceHeaders) => {
+      sourceHeaders.forEach((value, key) => {
+        const lowerKey = key.toLowerCase();
+        const headersToSkip = ['content-encoding', 'content-length', 'transfer-encoding'];
+        if (!headersToSkip.includes(lowerKey)) {
+          res.setHeader(key, value);
+        }
+      });
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    };
+
+    // ОБРАБОТКА ОШИБОК (503, 400 и т.д.)
     if (!response.ok) {
       const errorText = await response.text();
       console.log(`⚠️ Ошибка от ${provider}:`, errorText);
-      response.headers.forEach((v, k) => res.setHeader(k, v));
-      res.setHeader('Access-Control-Allow-Origin', '*');
+      setSafeHeaders(response.headers);
       return res.status(response.status).send(errorText);
     }
 
-    response.headers.forEach((value, key) => {
-      const lowerKey = key.toLowerCase();
-      const headersToSkip = ['content-encoding', 'content-length', 'transfer-encoding'];
-      if (!headersToSkip.includes(lowerKey)) {
-        res.setHeader(key, value);
-      }
-    });
-    
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // ОБРАБОТКА УСПЕШНОГО ОТВЕТА
+    setSafeHeaders(response.headers);
     if (fetchHeaders.get('accept') === 'text/event-stream') {
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -108,12 +117,9 @@ app.all('/*', async (req, res) => {
         const { done, value } = await reader.read();
         if (done) break;
 
-        // Декодируем входящие байты в текст
         buffer += decoder.decode(value, { stream: true });
-        
-        // SSE (Server-Sent Events) разделяются двумя переносами строк
         let parts = buffer.split('\n\n');
-        buffer = parts.pop(); // Последний кусок может быть неполным, оставляем в буфере
+        buffer = parts.pop();
 
         for (const part of parts) {
           if (part.startsWith('data: ')) {
@@ -125,21 +131,14 @@ app.all('/*', async (req, res) => {
 
             try {
               let dataObj = JSON.parse(dataStr);
-              
-              // --- ИСПРАВЛЕНИЕ БАГА GOOGLE (ИНЪЕКЦИЯ INDEX) ---
-              if (dataObj.choices && dataObj.choices[0] && dataObj.choices[0].delta && dataObj.choices[0].delta.tool_calls) {
+              // ЛЕЧИМ ТУЛЫ: вставляем index, если Google его забыл
+              if (dataObj.choices?.[0]?.delta?.tool_calls) {
                 dataObj.choices[0].delta.tool_calls.forEach((tc, idx) => {
-                  if (tc.index === undefined) {
-                    tc.index = idx; // Жестко добавляем index
-                  }
+                  if (tc.index === undefined) tc.index = idx;
                 });
               }
-              // ------------------------------------------------
-
-              // Отправляем вылеченный JSON обратно клиенту
               res.write(`data: ${JSON.stringify(dataObj)}\n\n`);
             } catch (e) {
-              // Если это не JSON, отдаем как есть
               res.write(`${part}\n\n`);
             }
           } else {
@@ -147,17 +146,14 @@ app.all('/*', async (req, res) => {
           }
         }
       }
-      
-      // Сбрасываем остатки буфера, если они есть
       if (buffer.length > 0) res.write(buffer);
       res.end();
-      
     } else {
       res.end();
     }
 
   } catch (err) {
-    console.log(`❌ Ошибка:`, err.message);
+    console.log(`❌ Ошибка прокси:`, err.message);
     res.status(502).json({ error: 'Proxy error', details: err.message });
   }
 });
