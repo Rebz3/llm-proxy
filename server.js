@@ -2,13 +2,13 @@ const express = require('express');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Читаем тело запроса как "сырой" буфер для максимальной точности
+// Читаем входящее тело запроса как "сырой" буфер
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 app.all('/*', async (req, res) => {
   console.log(`\n[${new Date().toISOString()}] Входящий запрос: ${req.method} ${req.path}`);
 
-  // 1. Обработка CORS (для работы из браузеров)
+  // 1. Обработка CORS (для работы из браузеров и IDE)
   if (req.method === 'OPTIONS') {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -20,18 +20,18 @@ app.all('/*', async (req, res) => {
   const authHeader = req.headers['authorization'];
   let clientPassword = '';
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    clientPassword = authHeader.substring(7);
+    clientPassword = authHeader.substring(7).trim();
   }
 
   if (clientPassword !== process.env.PROXY_PASSWORD) {
-    console.log('❌ Ошибка: Неверный или отсутствующий пароль');
-    return res.status(401).json({ error: 'Unauthorized: Invalid Bearer Token' });
+    console.log('❌ Ошибка: Неверный пароль в Authorization header');
+    return res.status(401).json({ error: 'Unauthorized: Invalid Proxy Password' });
   }
 
-  // 3. Разбор пути (например: /gemini/v1beta/...)
+  // 3. Разбор провайдера и пути
   const pathSegments = req.path.split('/').filter(Boolean);
   if (pathSegments.length === 0) {
-    return res.status(200).send('Unified LLM Proxy is LIVE.');
+    return res.status(200).send('Unified Streaming Proxy is LIVE.');
   }
 
   const provider = pathSegments[0].toLowerCase();
@@ -40,7 +40,7 @@ app.all('/*', async (req, res) => {
   let targetBaseUrl = '';
   const fetchHeaders = new Headers();
 
-  // Копируем базовые заголовки (кроме служебных и авторизации)
+  // Копируем базовые заголовки клиента (кроме служебных)
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
     const skipHeaders = ['host', 'connection', 'content-length', 'authorization', 'x-forwarded-for', 'x-real-ip', 'forwarded'];
@@ -49,17 +49,15 @@ app.all('/*', async (req, res) => {
     }
   }
 
-  // 4. Логика подстановки API ключей
+  // 4. Подстановка секретных API-ключей в зависимости от провайдера
   if (provider === 'gemini') {
     targetBaseUrl = 'https://generativelanguage.googleapis.com';
-    
-    // ФИКС: Если запрос идет через OpenAI-совместимый путь, используем Bearer
+    // Если путь содержит /openai/, Google ждет ключ в Bearer, иначе в x-goog-api-key
     if (remainingPath.includes('/openai/')) {
       fetchHeaders.set('Authorization', `Bearer ${process.env.GEMINI_API_KEY}`);
     } else {
       fetchHeaders.set('x-goog-api-key', process.env.GEMINI_API_KEY);
     }
-    
   } else if (provider === 'openai') {
     targetBaseUrl = 'https://api.openai.com';
     fetchHeaders.set('Authorization', `Bearer ${process.env.OPENAI_API_KEY}`);
@@ -79,28 +77,31 @@ app.all('/*', async (req, res) => {
     headers: fetchHeaders,
   };
 
-  // 5. Пересылка тела запроса
+  // Пересылаем тело запроса, если оно есть
   if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
     const bodyString = req.body.toString('utf8');
     fetchOptions.body = bodyString;
-    // Обновляем длину контента, так как мы могли его пересобрать
     fetchHeaders.set('Content-Length', Buffer.byteLength(bodyString, 'utf8').toString());
   }
 
-  console.log(`➡️ Проксируем в ${provider}: ${targetUrl}`);
+  console.log(`➡️ Проксируем запрос в ${provider}: ${targetUrl}`);
 
-  // 6. Выполнение запроса и обработка ответа
+  // 5. Выполнение запроса и ПОТОКОВАЯ ПЕРЕДАЧА (Streaming)
   try {
     const response = await fetch(targetUrl, fetchOptions);
     console.log(`⬅️ Ответ от ${provider}: Статус ${response.status}`);
     
-    const buffer = await response.arrayBuffer();
-
+    // Если провайдер вернул ошибку, логируем ее тело целиком
     if (!response.ok) {
-      console.log(`⚠️ Текст ошибки от ${provider}:`, Buffer.from(buffer).toString('utf8'));
+      const errorText = await response.text();
+      console.log(`⚠️ Текст ошибки от ${provider}:`, errorText);
+      // Копируем заголовки ошибки и отправляем клиенту
+      response.headers.forEach((v, k) => res.setHeader(k, v));
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(response.status).send(errorText);
     }
 
-    // ФИКС ZlibError: Удаляем заголовки, которые заставляют клиента думать, что данные сжаты
+    // Настраиваем заголовки ответа (фильтруем сжатие, чтобы избежать ZlibError)
     response.headers.forEach((value, key) => {
       const lowerKey = key.toLowerCase();
       const headersToSkip = ['content-encoding', 'content-length', 'transfer-encoding'];
@@ -110,15 +111,33 @@ app.all('/*', async (req, res) => {
     });
     
     res.setHeader('Access-Control-Allow-Origin', '*');
+    // Обязательно для стриминга (SSE)
+    if (fetchHeaders.get('accept') === 'text/event-stream') {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+    }
+
     res.status(response.status);
-    res.send(Buffer.from(buffer));
+
+    // Стримим данные по кусочкам (сразу в ответ клиенту)
+    if (response.body) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(value); // Мгновенная отправка чанка (токена)
+      }
+      res.end();
+    } else {
+      res.end();
+    }
 
   } catch (err) {
-    console.log(`❌ Ошибка прокси:`, err.message);
+    console.log(`❌ Критическая ошибка прокси:`, err.message);
     res.status(502).json({ error: 'Proxy error', details: err.message });
   }
 });
 
 app.listen(port, () => {
-  console.log(`Proxy server is running on port ${port}`);
+  console.log(`Streaming Proxy is running on port ${port}`);
 });
